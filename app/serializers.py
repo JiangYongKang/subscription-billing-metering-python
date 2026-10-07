@@ -48,6 +48,9 @@ def bill_out(b):
         "currency": b.currency, "status": b.status.value,
         "subtotal_cents": b.subtotal_cents, "total_units": b.total_units,
         "overage_units": b.overage_units,
+        "paid_cents": b.paid_cents, "refunded_cents": b.refunded_cents,
+        "net_paid_cents": b.paid_cents - b.refunded_cents,
+        "due_cents": max(0, b.subtotal_cents - b.paid_cents),
         "is_adjustment": b.is_adjustment,
         "charge_attempts": b.charge_attempts,
         "failure_reason": b.failure_reason.value,
@@ -58,5 +61,36 @@ def bill_out(b):
             {"kind": l.kind, "description": l.description,
              "amount_cents": l.amount_cents, "detail": l.detail}
             for l in b.lines
+        ],
+    }
+
+
+def payment_out(p):
+    return {
+        "id": p.id, "bill_id": p.bill_id,
+        "subscription_id": p.subscription_id, "customer_id": p.customer_id,
+        "requested_status": p.status,
+        "amount_cents": p.amount_cents, "credit_cents": p.credit_cents,
+        "total_applied_cents": p.amount_cents + p.credit_cents,
+        "charge_attempt_id": p.charge_attempt_id,
+        "idempotency_key": p.idempotency_key,
+        "created_at": p.created_at.isoformat(),
+        "result": p.result.value if p.result else None,
+        "note": p.note,
+    }
+
+
+def refund_out(r):
+    return {
+        "id": r.id, "bill_id": r.bill_id,
+        "subscription_id": r.subscription_id, "customer_id": r.customer_id,
+        "amount_cents": r.amount_cents, "reason": r.reason,
+        "idempotency_key": r.idempotency_key,
+        "created_at": r.created_at.isoformat(),
+        "note": r.note,
+        "allocations": [
+            {"charge_attempt_id": a.charge_attempt_id,
+             "payment_id": a.payment_id, "amount_cents": a.amount_cents}
+            for a in r.allocations
         ],
     }

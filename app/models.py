@@ -39,6 +39,10 @@ class FailureReason(str, Enum):
 class LedgerEntryType(str, Enum):
     CHARGE_SUCCESS = "charge_success"
     CHARGE_FAILURE = "charge_failure"
+    PAYMENT = "payment"                    # 分次付款网关成功扣款
+    CREDIT_APPLIED = "credit_applied"      # 退款额度抵扣账单
+    CREDIT_RELEASED = "credit_released"    # 扣款失败，已抵扣额度回滚
+    REFUND = "refund"                      # 退款（转为账户抵扣额度）
 
 
 @dataclass
@@ -132,6 +136,8 @@ class Bill:
     charge_attempts: int = 0
     idempotency_key: str = ""                  # 出账幂等键
     is_adjustment: bool = False                # 账后迟到用量调整单
+    paid_cents: int = 0                        # 累计实收（网关+额度抵扣，总额口径，不因退款回退）
+    refunded_cents: int = 0                    # 累计退款（退回账户抵扣额度）
 
 
 @dataclass
@@ -147,20 +153,93 @@ class ChargeAttempt:
     attempted_at: datetime
     ledger_entry_id: str | None = None
     dedup_idempotency_key: str = ""            # 已付清账单上并发/重复调用复用的尝试键
+    kind: str = "auto"                         # auto（整笔自动扣款）/ partial（分次付款）
+    payment_id: str | None = None              # kind=partial 时关联的 Payment
+    reversed: bool = False                     # 抵扣额度后网关失败，抵扣回滚标记
+
+
+@dataclass
+class Payment:
+    """同一张已出账账单上的一笔分次付款（可重复直到付清）。"""
+
+    id: str
+    bill_id: str
+    subscription_id: str
+    customer_id: str
+    amount_cents: int                          # 本次网关实际扣款
+    credit_cents: int                          # 本次先用账户抵扣额度冲抵的金额
+    idempotency_key: str                       # 付款幂等键（业务提交唯一）
+    charge_attempt_id: str
+    created_at: datetime
+    status: str = "success"                    # success / failed
+    result: ChargeResult | None = None         # 网关判定（失败时）
+    note: str = ""
+
+
+@dataclass
+class RefundAllocation:
+    """一笔退款在各成功付款尝试上的分摊明细（解释退的是哪一笔钱）。"""
+
+    charge_attempt_id: str
+    payment_id: str | None
+    amount_cents: int
+
+
+@dataclass
+class Refund:
+    """账单退款：全额或部分，退款默认转为该客户的账户抵扣额度。"""
+
+    id: str
+    bill_id: str
+    subscription_id: str
+    customer_id: str
+    amount_cents: int                          # 本次退款金额
+    idempotency_key: str
+    created_at: datetime
+    reason: str = ""
+    allocations: list[RefundAllocation] = field(default_factory=list)
+    ledger_entry_id: str | None = None
+    note: str = ""
+
+
+@dataclass
+class CreditApplication:
+    """账户抵扣额度冲抵某张账单的独立可对账记录（不可重复抵扣）。"""
+
+    id: str
+    bill_id: str
+    subscription_id: str
+    customer_id: str
+    amount_cents: int
+    created_at: datetime
+    source: str = "auto"                       # auto（出账后自动冲抵）/ manual
+    reversed: bool = False                     # 伴随的网关扣款失败而回滚
+    ledger_entry_id: str | None = None
+    reversal_entry_id: str | None = None
+    charge_attempt_id: str | None = None
+    note: str = ""
 
 
 @dataclass
 class LedgerEntry:
-    """资金流水：与扣款尝试一一对应（成功才实际入账）。"""
+    """资金流水。
+
+    与扣款尝试一一对应的扣款流水（成功正收入、失败 0）；分次付款、额度抵扣、
+    抵扣回滚、退款各自独立成条，保证每一分钱都可对账。
+    """
 
     id: str
     bill_id: str
     subscription_id: str
     entry_type: LedgerEntryType
-    amount_cents: int                        # 成功为正收入；失败为 0
+    amount_cents: int                        # 成功为正收入；失败为 0；退款/抵扣按类型取符号约定
     currency: str
     created_at: datetime
-    charge_attempt_id: str
+    charge_attempt_id: str | None = None
+    payment_id: str | None = None
+    refund_id: str | None = None
+    credit_application_id: str | None = None
+    customer_id: str = ""
     note: str = ""
 
 
@@ -169,4 +248,5 @@ class PaymentAccount:
     customer_id: str
     card_active: bool = True                  # 卡片是否有效（失效则终态拒付）
     balance_cents: int = 0                    # 模拟余额
+    credit_cents: int = 0                     # 退款留存的可抵扣额度（分）
     updated_at: datetime | None = None

@@ -1,18 +1,22 @@
-"""本地模拟支付网关与扣款编排。
+"""本地模拟支付网关与扣款编排（整笔自动扣款 + 分次付款共用网关）。
 
 - 扣款幂等键 = f"charge:{bill_id}:{attempt_no}"。真实扣款 + 记账 + 账单
   状态迁移在同一把存储锁内完成，因此同一账单的并发扣款最多一次成功，
   重试成功后也不会重复扣款。
+- 扣款前若客户账户有退款留存的抵扣额度，先用额度冲抵（独立 CreditApplication
+  + credit_applied 流水），不够的部分再走网关；若网关失败，本次额度冲抵
+  整体回滚（credit_released 流水），保证不丢额度、账目对得上。
 - 失败原因可区分：余额不足(可重试) / 卡片失效(终态) / 网关错误(可重试) /
   无支付方式 / 重试耗尽。
-- 重试节奏：base_interval * 2^(attempt_no-1) 秒退避。
+- 重试节奏：base_interval * 2^(n-1) 秒退避。
 """
 
 import logging
 
 from app.clock import as_utc
+from app.credits import apply_credit_to_bill, reverse_credit_application
 from app.errors import StateError
-from app.ledger import record_attempt
+from app.ledger import record_attempt, refresh_bill_totals
 from app.models import (
     Bill,
     BillStatus,
@@ -52,11 +56,12 @@ def ensure_account(
             )
             store.accounts[customer_id] = acct
         else:
+            # 只重置模拟余额与卡片状态；退款留存的抵扣额度独立保留，不被覆盖
             acct.balance_cents = balance_cents
             acct.card_active = card_active
             acct.updated_at = store.now()
-        logger.info("ensure_account customer=%s balance=%d card_active=%s",
-                    customer_id, balance_cents, card_active)
+        logger.info("ensure_account customer=%s balance=%d credit=%d card_active=%s",
+                    customer_id, balance_cents, acct.credit_cents, card_active)
         return acct
 
 
@@ -64,6 +69,9 @@ def gateway_authorize(
     store: Store, amount_cents: int, customer_id: str
 ) -> ChargeResult:
     """模拟网关判定（调用方需持有 store.lock）。"""
+    if amount_cents <= 0:
+        logger.info("gateway: customer=%s amount=0 skip charge", customer_id)
+        return ChargeResult.SUCCESS
     acct = store.accounts.get(customer_id)
     if acct is None:
         return ChargeResult.GATEWAY_ERROR
@@ -119,7 +127,6 @@ def charge_bill(
         if bill.status != BillStatus.FINALIZED:
             raise StateError(f"bill {bill.id} is {bill.status.value}; finalize before charge")
 
-        acct = store.accounts.get(bill.customer_id)
         last = _last_attempt(store, bill)
         attempt_no = _force_attempt_no or (last.attempt_no + 1 if last else 1)
         idem = f"charge:{bill.id}:{attempt_no}"
@@ -130,11 +137,23 @@ def charge_bill(
             logger.info("charge idempotent hit bill=%s attempt=%d", bill.id, attempt_no)
             return store.attempts[existing_id]
 
-        if acct is None:
+        # 1) 先用账户抵扣额度冲抵未付部分
+        due_before = max(0, bill.subtotal_cents - bill.paid_cents)
+        credit_app = apply_credit_to_bill(
+            store, bill, source="auto", max_cents=due_before
+        )
+        credit_used = credit_app.amount_cents if credit_app else 0
+        cash_needed = due_before - credit_used
+
+        acct = store.accounts.get(bill.customer_id)
+        if cash_needed <= 0:
+            result = ChargeResult.SUCCESS
+            detail = "covered by account credit"
+        elif acct is None:
             result = ChargeResult.GATEWAY_ERROR
             detail = "no payment account configured"
         else:
-            result = gateway_authorize(store, bill.subtotal_cents, bill.customer_id)
+            result = gateway_authorize(store, cash_needed, bill.customer_id)
             detail = "authorized" if result == ChargeResult.SUCCESS else result.value
 
         attempt = ChargeAttempt(
@@ -142,18 +161,31 @@ def charge_bill(
             bill_id=bill.id,
             subscription_id=bill.subscription_id,
             attempt_no=attempt_no,
-            amount_cents=bill.subtotal_cents,
+            amount_cents=cash_needed,
             result=result,
             reason_detail=detail,
             idempotency_key=idem,
             attempted_at=store.now(),
+            kind="auto",
         )
         store.attempts[attempt.id] = attempt
         store.attempts_by_key[idem] = attempt.id
         bill.charge_attempts = max(bill.charge_attempts, attempt_no)
+        if credit_app is not None:
+            credit_app.charge_attempt_id = attempt.id
+
+        # 网关失败：回滚本次额度冲抵，失败流水金额 0，保持原有重试语义
+        if result != ChargeResult.SUCCESS and credit_app is not None:
+            reverse_credit_application(store, credit_app)
+            attempt.reversed = True
 
         entry = record_attempt(store, attempt)
         attempt.ledger_entry_id = entry.id
+        # 额度全额覆盖时，attempt 现金为 0；抵扣流水在 apply 时已写入并挂账
+        if cash_needed <= 0 and credit_app is not None:
+            attempt.ledger_entry_id = entry.id
+
+        refresh_bill_totals(store, bill)
 
         sub = store.get_subscription(bill.subscription_id)
         if result == ChargeResult.SUCCESS:
@@ -163,8 +195,10 @@ def charge_bill(
             if sub.state == SubscriptionState.PAST_DUE:
                 sub.state = SubscriptionState.ACTIVE
                 sub.grace_until = None
-            logger.info("charge SUCCESS bill=%s attempt=%d cents=%d -> PAID",
-                        bill.id, attempt_no, bill.subtotal_cents)
+            logger.info(
+                "charge SUCCESS bill=%s attempt=%d credit=%d cash=%d -> PAID",
+                bill.id, attempt_no, credit_used, cash_needed,
+            )
         else:
             if acct is None:
                 bill.failure_reason = FailureReason.NO_PAYMENT_METHOD
@@ -173,7 +207,7 @@ def charge_bill(
             if sub.state == SubscriptionState.ACTIVE:
                 sub.state = SubscriptionState.PAST_DUE
             logger.warning(
-                "charge FAIL bill=%s attempt=%d reason=%s detail=%s",
-                bill.id, attempt_no, bill.failure_reason.value, detail,
+                "charge FAIL bill=%s attempt=%d reason=%s detail=%s credit_released=%d",
+                bill.id, attempt_no, bill.failure_reason.value, detail, credit_used,
             )
         return attempt

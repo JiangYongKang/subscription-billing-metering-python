@@ -16,10 +16,13 @@ from app.errors import NotFoundError
 from app.models import (
     Bill,
     ChargeAttempt,
+    CreditApplication,
     LedgerEntry,
+    Payment,
     PaymentAccount,
     Plan,
     PlanChange,
+    Refund,
     Subscription,
     UsageEvent,
 )
@@ -47,6 +50,14 @@ class Store:
         self.idempotents: dict[str, object] = {}
         self.ledger: list[LedgerEntry] = []
         self.accounts: dict[str, PaymentAccount] = {}
+        # 分次付款：payment_id -> Payment；幂等键 -> payment_id
+        self.payments: dict[str, Payment] = {}
+        self.payments_by_key: dict[str, str] = {}
+        # 退款：refund_id -> Refund；幂等键 -> refund_id
+        self.refunds: dict[str, Refund] = {}
+        self.refunds_by_key: dict[str, str] = {}
+        # 账户抵扣额度冲抵记录：credit_id -> CreditApplication
+        self.credit_applications: dict[str, CreditApplication] = {}
         self._counters: dict[str, int] = {}
 
     def now(self) -> datetime:

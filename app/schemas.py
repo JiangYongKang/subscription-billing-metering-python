@@ -50,5 +50,16 @@ class ChargeIn(BaseModel):
     pass
 
 
+class PaymentIn(BaseModel):
+    amount_cents: int = Field(gt=0)
+    idempotency_key: str
+
+
+class RefundIn(BaseModel):
+    amount_cents: int = Field(gt=0)
+    idempotency_key: str
+    reason: str = ""
+
+
 class ClockIn(BaseModel):
     now: datetime

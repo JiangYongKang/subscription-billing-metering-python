@@ -6,7 +6,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app import billing, grace, ledger, metering, payments, subscriptions
+from app import (
+    billing,
+    grace,
+    installments,
+    ledger,
+    metering,
+    payments,
+    refunds,
+    subscriptions,
+)
 from app.clock import Clock
 from app.errors import BillingError
 from app.schemas import (
@@ -14,12 +23,21 @@ from app.schemas import (
     CancelIn,
     ChargeIn,
     ClockIn,
+    PaymentIn,
     PlanChangeIn,
     PlanIn,
+    RefundIn,
     SubscriptionIn,
     UsageIn,
 )
-from app.serializers import bill_out, change_out, plan_out, sub_out
+from app.serializers import (
+    bill_out,
+    change_out,
+    payment_out,
+    plan_out,
+    refund_out,
+    sub_out,
+)
 from app.store import Store
 
 logger = logging.getLogger("billing")
@@ -43,7 +61,7 @@ def create_app() -> FastAPI:
             content={"error": exc.code, "message": str(exc)},
         )
 
-    store = lambda: app.state.store  # noqa: E731
+    store = lambda: app.state.store
 
     # ---- 管理/测试设施 ----------------------------------------------
     @app.post("/admin/clock")
@@ -92,7 +110,7 @@ def create_app() -> FastAPI:
             app.state.store, body.customer_id, body.balance_cents, body.card_active
         )
         return {"customer_id": acct.customer_id, "balance_cents": acct.balance_cents,
-                "card_active": acct.card_active}
+                "credit_cents": acct.credit_cents, "card_active": acct.card_active}
 
     # ---- 订阅 --------------------------------------------------------
     @app.post("/subscriptions", status_code=201)
@@ -208,6 +226,45 @@ def create_app() -> FastAPI:
     @app.get("/bills/{bill_id}/reconcile")
     def reconcile(bill_id: str):
         return ledger.reconcile(store(), bill_id)
+
+    # ---- 分次付款 / 退款 / 账户抵扣额度 ------------------------------
+    @app.post("/bills/{bill_id}/payments")
+    def pay_bill(bill_id: str, body: PaymentIn):
+        payment = installments.pay_bill(
+            store(), bill_id, body.amount_cents, body.idempotency_key
+        )
+        bill = app.state.store.get_bill(bill_id)
+        out = payment_out(payment)
+        out["bill_status"] = bill.status.value
+        out["bill_paid_cents"] = bill.paid_cents
+        out["bill_due_cents"] = max(0, bill.subtotal_cents - bill.paid_cents)
+        return out
+
+    @app.post("/bills/{bill_id}/refunds")
+    def refund_bill(bill_id: str, body: RefundIn):
+        rfd = refunds.refund_bill(
+            store(), bill_id, body.amount_cents, body.idempotency_key,
+            reason=body.reason,
+        )
+        bill = app.state.store.get_bill(bill_id)
+        out = refund_out(rfd)
+        out["bill_status"] = bill.status.value
+        out["bill_refunded_cents"] = bill.refunded_cents
+        out["account_credit_cents"] = app.state.store.accounts[
+            bill.customer_id
+        ].credit_cents
+        return out
+
+    @app.get("/bills/{bill_id}/refunds")
+    def list_refunds(bill_id: str):
+        return [
+            refund_out(r) for r in app.state.store.refunds.values()
+            if r.bill_id == bill_id
+        ]
+
+    @app.get("/accounts/{customer_id}/credit")
+    def account_credit(customer_id: str):
+        return ledger.reconcile_account(store(), customer_id)
 
     return app
 
