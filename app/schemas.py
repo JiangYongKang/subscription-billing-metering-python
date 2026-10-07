@@ -50,5 +50,16 @@ class ChargeIn(BaseModel):
     pass
 
 
+class PaymentIn(BaseModel):
+    amount_cents: int = Field(gt=0)
+    idempotency_key: str
+
+
+class RefundIn(BaseModel):
+    amount_cents: int | None = Field(default=None, gt=0)  # 缺省 = 该笔可退余额全退
+    reason: str = ""
+    idempotency_key: str = ""
+
+
 class ClockIn(BaseModel):
     now: datetime

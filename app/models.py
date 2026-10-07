@@ -39,6 +39,9 @@ class FailureReason(str, Enum):
 class LedgerEntryType(str, Enum):
     CHARGE_SUCCESS = "charge_success"
     CHARGE_FAILURE = "charge_failure"
+    PAYMENT = "payment"                # 分次付款实收
+    REFUND = "refund"                  # 退款（金额为负，资金流出）
+    CREDIT_APPLY = "credit_apply"      # 账户抵扣额度冲抵账单
 
 
 @dataclass
@@ -132,6 +135,18 @@ class Bill:
     charge_attempts: int = 0
     idempotency_key: str = ""                  # 出账幂等键
     is_adjustment: bool = False                # 账后迟到用量调整单
+    paid_cents: int = 0                        # 实收合计（扣款+分次付款，含已退部分）
+    credit_applied_cents: int = 0              # 账户抵扣额度已冲抵金额
+
+    @property
+    def settled_cents(self) -> int:
+        """已结清金额 = 实收 + 抵扣。"""
+        return self.paid_cents + self.credit_applied_cents
+
+    @property
+    def remaining_cents(self) -> int:
+        """还差多少才付清。"""
+        return max(0, self.subtotal_cents - self.settled_cents)
 
 
 @dataclass
@@ -162,6 +177,58 @@ class LedgerEntry:
     created_at: datetime
     charge_attempt_id: str
     note: str = ""
+    ref_id: str = ""                         # 关联的 payment/refund/credit 记录 id
+
+
+@dataclass
+class Payment:
+    """一笔实收付款（整笔扣款成功或分次付款都会产生）。
+
+    退款以 Payment 为锚点：refunded_cents 累计已退，不得超过 amount_cents。
+    """
+
+    id: str
+    bill_id: str
+    subscription_id: str
+    customer_id: str
+    amount_cents: int
+    method: str                              # charge=自动扣款 / manual=分次付款
+    idempotency_key: str                     # 付款幂等键，重复提交返回同一笔
+    created_at: datetime
+    charge_attempt_id: str | None = None     # method=charge 时关联的扣款尝试
+    refunded_cents: int = 0
+
+    @property
+    def refundable_cents(self) -> int:
+        return self.amount_cents - self.refunded_cents
+
+
+@dataclass
+class Refund:
+    """一笔退款：钱退回账户抵扣额度，不改写历史账单金额与明细。"""
+
+    id: str
+    payment_id: str                          # 退的是哪一笔付款
+    bill_id: str
+    subscription_id: str
+    customer_id: str
+    amount_cents: int
+    reason: str
+    idempotency_key: str
+    created_at: datetime
+
+
+@dataclass
+class CreditApplication:
+    """一次账户抵扣：出账时用抵扣额度冲抵账单，一张账单只应用一次。"""
+
+    id: str
+    bill_id: str
+    subscription_id: str
+    customer_id: str
+    amount_cents: int
+    idempotency_key: str
+    created_at: datetime
 
 
 @dataclass
@@ -169,4 +236,5 @@ class PaymentAccount:
     customer_id: str
     card_active: bool = True                  # 卡片是否有效（失效则终态拒付）
     balance_cents: int = 0                    # 模拟余额
+    credit_balance_cents: int = 0             # 退款沉淀的抵扣额度
     updated_at: datetime | None = None

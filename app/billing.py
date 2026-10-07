@@ -9,6 +9,7 @@
 
 import logging
 
+from app import credits
 from app.clock import as_utc
 from app.errors import StateError
 from app.models import (
@@ -121,6 +122,8 @@ def finalize_bill(store: Store, bill_id: str) -> Bill:
             sum(l.amount_cents for l in lines if l.kind == "proration"),
             bill.overage_units, bill.subtotal_cents,
         )
+        # 出账后先用账户抵扣额度冲抵，不足部分再走原支付方式
+        credits.apply_credit_to_bill(store, bill.id)
         return bill
 
 
@@ -179,6 +182,7 @@ def create_adjustment_for_late_usage(store: Store, bill_id: str) -> Bill | None:
         store.bills[adj.id] = adj
         logger.info("adjustment bill=%s parent=%s late_units=%d cents=%d",
                     adj.id, closed.id, total_units, amount)
+        credits.apply_credit_to_bill(store, adj.id)
         return adj
 
 

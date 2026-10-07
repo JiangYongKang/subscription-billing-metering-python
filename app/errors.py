@@ -42,3 +42,24 @@ class PaymentTerminalError(BillingError):
 
     code = "payment_terminal"
     http_status = 402
+
+
+class PaymentDeclinedError(BillingError):
+    """分次付款被网关拒绝（余额不足 / 卡片失效），未产生任何资金变动。"""
+
+    code = "payment_declined"
+    http_status = 402
+
+
+class OverpaymentError(BillingError):
+    """付款金额超过账单剩余应付。"""
+
+    code = "overpayment"
+    http_status = 409
+
+
+class RefundExceededError(BillingError):
+    """退款金额超过该笔付款的实际可退余额。"""
+
+    code = "refund_exceeded"
+    http_status = 409

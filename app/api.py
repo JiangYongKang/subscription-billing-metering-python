@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app import billing, grace, ledger, metering, payments, subscriptions
+from app import billing, credits, grace, ledger, metering, payments, refunds, subscriptions
 from app.clock import Clock
 from app.errors import BillingError
 from app.schemas import (
@@ -14,12 +14,22 @@ from app.schemas import (
     CancelIn,
     ChargeIn,
     ClockIn,
+    PaymentIn,
     PlanChangeIn,
     PlanIn,
+    RefundIn,
     SubscriptionIn,
     UsageIn,
 )
-from app.serializers import bill_out, change_out, plan_out, sub_out
+from app.serializers import (
+    bill_out,
+    change_out,
+    credit_out,
+    payment_out,
+    plan_out,
+    refund_out,
+    sub_out,
+)
 from app.store import Store
 
 logger = logging.getLogger("billing")
@@ -92,7 +102,19 @@ def create_app() -> FastAPI:
             app.state.store, body.customer_id, body.balance_cents, body.card_active
         )
         return {"customer_id": acct.customer_id, "balance_cents": acct.balance_cents,
-                "card_active": acct.card_active}
+                "card_active": acct.card_active,
+                "credit_balance_cents": acct.credit_balance_cents}
+
+    @app.get("/accounts/{customer_id}")
+    def get_account(customer_id: str):
+        acct = app.state.store.account(customer_id)
+        if acct is None:
+            from app.errors import NotFoundError
+
+            raise NotFoundError(f"account not found: {customer_id}")
+        return {"customer_id": acct.customer_id, "balance_cents": acct.balance_cents,
+                "card_active": acct.card_active,
+                "credit_balance_cents": acct.credit_balance_cents}
 
     # ---- 订阅 --------------------------------------------------------
     @app.post("/subscriptions", status_code=201)
@@ -208,6 +230,50 @@ def create_app() -> FastAPI:
     @app.get("/bills/{bill_id}/reconcile")
     def reconcile(bill_id: str):
         return ledger.reconcile(store(), bill_id)
+
+    # ---- 分次付款 / 退款 / 抵扣 ---------------------------------------
+    @app.post("/bills/{bill_id}/payments")
+    def pay(bill_id: str, body: PaymentIn):
+        outcome = payments.pay_bill(
+            store(), bill_id, body.amount_cents, body.idempotency_key
+        )
+        return {
+            "payment": payment_out(outcome.payment) if outcome.payment else None,
+            "bill_status": outcome.bill_status.value,
+            "paid_cents": outcome.paid_cents,
+            "remaining_cents": outcome.remaining_cents,
+            "duplicate": outcome.duplicate,
+            "already_settled": outcome.already_settled,
+        }
+
+    @app.get("/bills/{bill_id}/payments")
+    def list_payments(bill_id: str):
+        app.state.store.get_bill(bill_id)  # 404 if missing
+        return [
+            payment_out(p) for p in app.state.store.payments.values()
+            if p.bill_id == bill_id
+        ]
+
+    @app.post("/payments/{payment_id}/refunds", status_code=201)
+    def refund(payment_id: str, body: RefundIn):
+        refund_obj, created = refunds.refund_payment(
+            store(), payment_id, body.amount_cents, body.reason,
+            body.idempotency_key,
+        )
+        return {"created": created, "refund": refund_out(refund_obj)}
+
+    @app.get("/bills/{bill_id}/refunds")
+    def list_refunds(bill_id: str):
+        app.state.store.get_bill(bill_id)
+        return [refund_out(r) for r in refunds.refunds_for_bill(store(), bill_id)]
+
+    @app.get("/bills/{bill_id}/credits")
+    def list_credits(bill_id: str):
+        app.state.store.get_bill(bill_id)
+        return [
+            credit_out(c) for c in app.state.store.credit_apps.values()
+            if c.bill_id == bill_id
+        ]
 
     return app
 
